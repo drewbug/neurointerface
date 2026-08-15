@@ -1,1 +1,3 @@
 # neurointerface.js
+
+![](npm.svg)
