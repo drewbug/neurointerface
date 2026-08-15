@@ -1,0 +1,15 @@
+{
+  "name": "neurointerface",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": "./neurointerface.js",
+  "bin": {
+    "neurointerface": "./neurointerface.js"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@stoprocent/noble": "^2.7.1"
+  }
+}
