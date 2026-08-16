@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-export function webBluetoothConnection(device) {
+const neurointerface = {};
+
+neurointerface.webBluetoothConnection = (device) => {
   const bytes = (view) => new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
   const characteristic = (c) => ({
     read: async () => bytes(await c.readValue()),
@@ -24,48 +26,7 @@ export function webBluetoothConnection(device) {
     disconnect: async () => device.gatt.disconnect(),
     getService: async (uuid) => service(await device.gatt.getPrimaryService(uuid)),
   };
-}
-
-export function nobleConnection(peripheral) {
-  const characteristic = (c) => ({
-    uuid: c.uuid,
-    read: async () => new Uint8Array(await c.readAsync()),
-    write: (data) => c.writeAsync(Buffer.from(data), false),
-    subscribe: async (listener) => {
-      const onData = (buffer) => listener(new Uint8Array(buffer));
-      c.on("data", onData);
-      await c.subscribeAsync();
-      return async () => {
-        c.removeListener("data", onData);
-        await c.unsubscribeAsync();
-      };
-    },
-  });
-  const service = (s) => {
-    let characteristics;
-    return {
-      uuid: s.uuid,
-      getCharacteristic: async (uuid) =>
-        findUuid(await (characteristics ??= s.discoverCharacteristicsAsync().then((list) => list.map(characteristic))), uuid),
-    };
-  };
-  let services;
-  return {
-    name: peripheral.advertisement.localName,
-    connect: async () => { services = undefined; await peripheral.connectAsync(); },
-    disconnect: () => peripheral.disconnectAsync(),
-    getService: async (uuid) =>
-      findUuid(await (services ??= peripheral.discoverServicesAsync().then((list) => list.map(service))), uuid),
-  };
-}
-
-const bareUuid = (uuid) => uuid.toLowerCase().replace(/-/g, "").replace(/^0000(.{4})00001000800000805f9b34fb$/, "$1");
-
-function findUuid(items, uuid) {
-  const item = items.find((candidate) => bareUuid(candidate.uuid) === bareUuid(uuid));
-  if (!item) throw new Error(`${uuid} not found`);
-  return item;
-}
+};
 
 const MENDI_SERVICE = "fc3eabb0-c6c4-49e6-922a-6e551c455af5";
 const MENDI_FRAME = "fc3eabb1-c6c4-49e6-922a-6e551c455af5";
@@ -78,7 +39,7 @@ const HARDWARE_REVISION = "00002a27-0000-1000-8000-00805f9b34fb";
 const FIRMWARE_REVISION = "00002a26-0000-1000-8000-00805f9b34fb";
 const FRAME_FIELDS = ["accX", "accY", "accZ", "angX", "angY", "angZ", "temp", "irL", "irR", "irP", "redL", "redR", "redP", "ambL", "ambR", "ambP"];
 
-export class Mendi {
+neurointerface.Mendi = class Mendi {
   constructor(connection) {
     this.connection = connection;
   }
@@ -92,7 +53,7 @@ export class Mendi {
       filters: [{ namePrefix: "Mendi" }, { services: [MENDI_SERVICE] }],
       optionalServices: [MENDI_SERVICE, DEVICE_INFORMATION],
     });
-    return new Mendi(webBluetoothConnection(device));
+    return new Mendi(neurointerface.webBluetoothConnection(device));
   }
 
   get name() { return this.connection.name; }
@@ -126,7 +87,7 @@ export class Mendi {
   async #subscribe(uuid, decode, listener) {
     return (await this.#characteristic(uuid)).subscribe((bytes) => listener(decode(bytes)));
   }
-}
+};
 
 function decodeFrame(bytes) {
   const fields = decodeProtobuf(bytes);
@@ -171,34 +132,85 @@ function decodeProtobuf(bytes) {
   return fields;
 }
 
-const SCAN_MS = 5000;
+// ---- Node only from here on; index.html carries a verbatim copy of everything above (minus the shebang) ----
 
-async function main([command, target]) {
-  if (command !== "scan" && command !== "mendi") {
-    console.log("Usage:\n  neurointerface scan\n  neurointerface mendi [target]");
-    return;
-  }
+const bareUuid = (uuid) => uuid.toLowerCase().replace(/-/g, "").replace(/^0000(.{4})00001000800000805f9b34fb$/, "$1");
+
+function findUuid(items, uuid) {
+  const item = items.find((candidate) => bareUuid(candidate.uuid) === bareUuid(uuid));
+  if (!item) throw new Error(`${uuid} not found`);
+  return item;
+}
+
+neurointerface.nobleConnection = (peripheral) => {
+  const characteristic = (c) => ({
+    uuid: c.uuid,
+    read: async () => new Uint8Array(await c.readAsync()),
+    write: (data) => c.writeAsync(Buffer.from(data), false),
+    subscribe: async (listener) => {
+      const onData = (buffer) => listener(new Uint8Array(buffer));
+      c.on("data", onData);
+      await c.subscribeAsync();
+      return async () => {
+        c.removeListener("data", onData);
+        await c.unsubscribeAsync();
+      };
+    },
+  });
+  const service = (s) => {
+    let characteristics;
+    return {
+      uuid: s.uuid,
+      getCharacteristic: async (uuid) =>
+        findUuid(await (characteristics ??= s.discoverCharacteristicsAsync().then((list) => list.map(characteristic))), uuid),
+    };
+  };
+  let services;
+  return {
+    name: peripheral.advertisement.localName,
+    connect: async () => { services = undefined; await peripheral.connectAsync(); },
+    disconnect: () => peripheral.disconnectAsync(),
+    getService: async (uuid) =>
+      findUuid(await (services ??= peripheral.discoverServicesAsync().then((list) => list.map(service))), uuid),
+  };
+};
+
+const SCAN_MS = 5000;
+const USAGE = [
+  "Usage:",
+  "  neurointerface scan",
+  "  neurointerface read --device mendi [--target <id|address|name>]",
+].join("\n");
+
+async function startNoble() {
   const noble = (await import("@stoprocent/noble")).default;
   await noble.waitForPoweredOnAsync();
-  if (command === "scan") {
-    noble.on("discover", (peripheral) => console.log(describe(peripheral)));
-    await noble.startScanningAsync([], false);
-    await new Promise((resolve) => setTimeout(resolve, SCAN_MS));
-    await noble.stopScanningAsync();
-  } else {
-    const peripheral = await findPeripheral(noble, (candidate) => target
-      ? [candidate.id, candidate.address, candidate.advertisement.localName].includes(target)
-      : Mendi.matchesName(candidate.advertisement.localName));
-    const mendi = new Mendi(nobleConnection(peripheral));
-    await mendi.connect();
-    console.error(describe(peripheral));
-    console.error(JSON.stringify(await mendi.readDeviceInfo()));
-    console.error(JSON.stringify(await mendi.readBattery()));
-    const unsubscribe = await mendi.subscribeFrames((frame) => console.log(JSON.stringify(frame)));
-    await new Promise((resolve) => process.once("SIGINT", resolve));
-    await unsubscribe();
-    await mendi.disconnect();
-  }
+  return noble;
+}
+
+async function scan() {
+  const noble = await startNoble();
+  noble.on("discover", (peripheral) => console.log(describe(peripheral)));
+  await noble.startScanningAsync([], false);
+  await new Promise((resolve) => setTimeout(resolve, SCAN_MS));
+  await noble.stopScanningAsync();
+  noble.stop();
+}
+
+async function readMendi(target) {
+  const noble = await startNoble();
+  const peripheral = await findPeripheral(noble, (candidate) => target
+    ? [candidate.id, candidate.address, candidate.advertisement.localName].includes(target)
+    : neurointerface.Mendi.matchesName(candidate.advertisement.localName));
+  const mendi = new neurointerface.Mendi(neurointerface.nobleConnection(peripheral));
+  await mendi.connect();
+  console.error(describe(peripheral));
+  console.error(JSON.stringify(await mendi.readDeviceInfo()));
+  console.error(JSON.stringify(await mendi.readBattery()));
+  const unsubscribe = await mendi.subscribeFrames((frame) => console.log(JSON.stringify(frame)));
+  await new Promise((resolve) => process.once("SIGINT", resolve));
+  await unsubscribe();
+  await mendi.disconnect();
   noble.stop();
 }
 
@@ -221,9 +233,23 @@ async function findPeripheral(noble, matches) {
   return peripheral;
 }
 
-if (import.meta.main) {
-  await main(process.argv.slice(2)).catch((error) => {
-    console.error(error.message);
-    process.exit(1);
-  });
+try {
+  const args = process.argv.slice(2), options = {}, positionals = [];
+  while (args.length) {
+    const arg = args.shift();
+    if (arg === "-h" || arg === "--help") options.help = true;
+    else if (arg === "--device" || arg === "--target") options[arg.slice(2)] = args.shift();
+    else if (arg.startsWith("-")) throw new Error(`unknown option "${arg}"\n${USAGE}`);
+    else positionals.push(arg);
+  }
+  const [command] = positionals;
+  if (options.help || !command) console.log(USAGE);
+  else if (command === "scan") await scan();
+  else if (command !== "read") throw new Error(`unknown command "${command}"\n${USAGE}`);
+  else if (!options.device) throw new Error(`read: --device is required\n${USAGE}`);
+  else if (options.device.toLowerCase() !== "mendi") throw new Error(`read: unsupported device "${options.device}" (only mendi is implemented)`);
+  else await readMendi(options.target);
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
 }
