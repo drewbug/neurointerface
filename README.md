@@ -1,6 +1,6 @@
 # neurointerface.js
 
-[![](npm.svg)](https://www.npmjs.com/package/neurointerface)
+Live Demo: https://ab3j.radio/neurointerface
 
 Connect to wearable neural devices over Bluetooth from the browser or the command line.
 
