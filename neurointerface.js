@@ -7,6 +7,7 @@ neurointerface.webBluetoothConnection = (device) => {
   const characteristic = (c) => ({
     read: async () => bytes(await c.readValue()),
     write: (data) => c.writeValueWithResponse(data),
+    writeWithoutResponse: (data) => c.writeValueWithoutResponse(data),
     subscribe: async (listener) => {
       const onChange = (event) => listener(bytes(event.target.value));
       c.addEventListener("characteristicvaluechanged", onChange);
@@ -136,7 +137,6 @@ const THYNC_SERVICE = "3789ff10-16ad-11e4-8c21-0800200c9a66";
 const THYNC_DATA = "3789ff11-16ad-11e4-8c21-0800200c9a66";
 const SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb";
 const SOFTWARE_REVISION = "00002a28-0000-1000-8000-00805f9b34fb";
-// Thync frames: [id, (destination << 4) | source, ...payload]
 const PUCK = {
   Echo: 0, Led: 1, Trigger: 2, Label: 3, NumDisplay: 4, Shutdown: 5, ErrorDebug: 6, ReadBatteryVoltage: 7, BatteryVoltage: 8,
   ReadButton: 9, Button: 10, HvControl: 11, ReadDeviceName: 12, DeviceName: 13, ReadFirmwareVersion: 14, FirmwareVersion: 15,
@@ -219,7 +219,7 @@ neurointerface.Thync = class Thync {
   }
 
   resetFromFault() { return this.send(PUCK.ResetFromFault, ENDPOINT.stm); }
-  keepAlive() { return this.send(PUCK.ReadBatteryDetail, ENDPOINT.lbm); } // the app's watchdog tick while a wave plays
+  keepAlive() { return this.send(PUCK.ReadBatteryDetail, ENDPOINT.lbm); }
 
   async readDeviceInfo() {
     const text = async (uuid) => {
@@ -259,7 +259,6 @@ neurointerface.Thync = class Thync {
   ledFlash(on) { return this.send(PUCK.LED_Flash, ENDPOINT.lbm, [on ? 0 : 1]); }
   shutdown() { return this.send(PUCK.Shutdown, ENDPOINT.lbm); }
 
-  // fresh: first wave of a session (NewWave 0); otherwise re-arm at a new current (NewWave 1)
   async startWave(wave, fresh = true) {
     const segments = thyncSegments(wave);
     await this.send(PUCK.NewWave, ENDPOINT.stm, [fresh ? 0 : 1, fresh ? segments.length : 0, 0, 0]);
@@ -304,7 +303,6 @@ function decodeElectrode(payload) {
   return payload.length ? ELECTRODE_STATES[payload[0]] ?? `0x${payload[0].toString(16)}` : undefined;
 }
 
-// wave: { current (mA), frequency (Hz), duty (%), dc (%), direction ("a" | "b"), shortCircuit, energy }
 const PULSE_A = 3, PULSE_B = 48, OPEN = 0, SHORT = 85, TIMER_HZ = 12000000, DURATION_MASK = 0xffffff;
 const clampDuration = (value) => Math.max(Math.min(Math.trunc(value), DURATION_MASK), 0);
 const waveState = (directionA, shortCircuit, energy, length) => (energy << 4) | (shortCircuit << 5) | (directionA << 6) | length;
@@ -376,6 +374,84 @@ function correctEnergySegments(segments) {
 
 const roundHalfEven = (value) => { const rounded = Math.round(value); return Math.abs(value % 1) === 0.5 && rounded % 2 ? rounded - 1 : rounded; };
 
+const NEO_SERVICE = "14b70001-c2e6-11e8-a355-529269fb1459";
+const NEO_DATA = "14b70002-c2e6-11e8-a355-529269fb1459";
+const NEO = { PROGRAM: 0x00, START: 0x02, BATTERY_REQ: 0x03, INFO_REQ: 0x07, PROGRAM_IN_PROGRESS: 0x17, START_STOP: 0x1a };
+const NEO_CUSTOM_PROGRAM = 0x0a;
+const NEO_FREQUENCIES = { "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "5.5": 6, "6": 7, "7.83": 8, "8": 9, "9": 10, "10": 11, "12": 12, "14": 13, "15": 14, "16.28": 15, "20": 16, "20.98": 17, "23": 18, "30": 19, "32.23": 20, "34": 21, "40": 22, "44": 23, "50.57": 24 };
+const NEO_POWERS = { "0.1": 0x40, "0.25": 0x30, "0.5": 0x20, "2.5": 0x10, "10": 0x50, "25": 0x60, "50": 0x70, "128": 0x80 };
+const NEO_COILS = { front: 1, left_right: 2, all: 3, main: 4, external: 5 };
+const NEO_PROGRAMS = { schumann: "7.83", delta: "3", theta: "6", alpha: "10", beta: "15", gamma: "40" };
+
+neurointerface.NeoRhythm = class NeoRhythm {
+  constructor(connection) {
+    this.connection = connection;
+    this.listeners = new Set();
+  }
+
+  static matchesName(name) {
+    return /neorhythm/i.test(name);
+  }
+
+  static async request() {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "NeoRhythm" }, { services: [NEO_SERVICE] }],
+      optionalServices: [NEO_SERVICE],
+    });
+    return new NeoRhythm(neurointerface.webBluetoothConnection(device));
+  }
+
+  static program(options) { return neoProgramFrame(options); }
+
+  get name() { return this.connection.name; }
+
+  async connect() {
+    await this.connection.connect();
+    this.data = await (await this.connection.getService(NEO_SERVICE)).getCharacteristic(NEO_DATA);
+    try {
+      this.unsubscribe = await this.data.subscribe((bytes) => {
+        const message = decodeNeo(bytes);
+        for (const listener of this.listeners) listener(message);
+      });
+    } catch { this.unsubscribe = null; }
+  }
+
+  async disconnect() {
+    await this.unsubscribe?.();
+    this.unsubscribe = null;
+    await this.connection.disconnect();
+  }
+
+  onMessage(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  send(bytes) { return this.data.writeWithoutResponse(Uint8Array.from(bytes)); }
+
+  program(options) { return this.send(neoProgramFrame(options)); }
+  start() { return this.send([NEO.START_STOP, 1]); }
+  stop() { return this.send([NEO.START_STOP, 0]); }
+  requestBattery() { return this.send([NEO.BATTERY_REQ]); }
+  requestInfo() { return this.send([NEO.INFO_REQ]); }
+};
+
+function neoProgramFrame({ program, frequency, power = "10", coils = "all", minutes = 20 }) {
+  const label = frequency ?? NEO_PROGRAMS[program];
+  const frequencyByte = NEO_FREQUENCIES[label];
+  if (frequencyByte === undefined) throw new Error(`unknown NeoRhythm frequency "${program ?? frequency}"`);
+  if (NEO_POWERS[power] === undefined) throw new Error(`unknown NeoRhythm power "${power}"`);
+  if (NEO_COILS[coils] === undefined) throw new Error(`unknown NeoRhythm coils "${coils}"`);
+  const duration = Math.max(0, Math.min(0xffff, Math.round(minutes)));
+  return [NEO.PROGRAM, NEO_CUSTOM_PROGRAM, NEO_POWERS[power] | NEO_COILS[coils], frequencyByte, (duration >> 8) & 0xff, duration & 0xff];
+}
+
+const NEO_NAME = Object.fromEntries(Object.entries(NEO).map(([name, type]) => [type, name]));
+function decodeNeo(bytes) {
+  const type = bytes[0];
+  return { type, name: NEO_NAME[type] ?? `0x${type.toString(16)}`, payload: bytes.subarray(1) };
+}
+
 const bareUuid = (uuid) => uuid.toLowerCase().replace(/-/g, "").replace(/^0000(.{4})00001000800000805f9b34fb$/, "$1");
 
 function findUuid(items, uuid) {
@@ -389,6 +465,7 @@ neurointerface.nobleConnection = (peripheral) => {
     uuid: c.uuid,
     read: async () => new Uint8Array(await c.readAsync()),
     write: (data) => c.writeAsync(Buffer.from(data), false),
+    writeWithoutResponse: (data) => c.writeAsync(Buffer.from(data), true),
     subscribe: async (listener) => {
       const onData = (buffer) => listener(new Uint8Array(buffer));
       c.on("data", onData);
@@ -423,6 +500,7 @@ const USAGE = [
   "  neurointerface scan",
   "  neurointerface read --device mendi [--target <id|address|name>]",
   "  neurointerface write --device thync --program calm|energy [--current <mA>] [--minutes <n>] [--target <id|address|name>]",
+  "  neurointerface write --device neorhythm --program schumann|delta|theta|alpha|beta|gamma [--power <mT>] [--coils <zone>] [--minutes <n>] [--target <id|address|name>]",
 ].join("\n");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -523,6 +601,23 @@ async function writeThync({ program, current = "1", minutes = "1", target }) {
   noble.stop();
 }
 
+
+async function writeNeoRhythm({ program, power = "10", coils = "all", minutes = "20", target }) {
+  const frame = neurointerface.NeoRhythm.program({ program, power, coils, minutes: Number(minutes) });
+  if (!(Number(minutes) > 0)) throw new Error("write: --minutes must be positive");
+  const { noble, device: neo } = await connectTo(neurointerface.NeoRhythm, target);
+  neo.onMessage((m) => console.log(JSON.stringify({ message: m.name })));
+  await neo.program({ program, power, coils, minutes: Number(minutes) });
+  await neo.start();
+  console.error(`neorhythm: ${program} · ${power} mT · ${coils} coils · ${minutes} min (Ctrl-C to stop)`);
+  const timer = setTimeout(() => process.emit("SIGINT"), Number(minutes) * 60000);
+  await new Promise((resolve) => process.once("SIGINT", resolve));
+  clearTimeout(timer);
+  await neo.stop();
+  console.error("stopped");
+  await neo.disconnect();
+  noble.stop();
+}
 function describe({ id, address, rssi, advertisement: { localName } }) {
   return `${localName ?? "(no name)"}  id=${id}${address ? `  address=${address}` : ""}  rssi=${rssi}`;
 }
@@ -547,7 +642,7 @@ try {
   while (args.length) {
     const arg = args.shift();
     if (arg === "-h" || arg === "--help") options.help = true;
-    else if (["--device", "--target", "--program", "--current", "--minutes"].includes(arg)) options[arg.slice(2)] = args.shift();
+    else if (["--device", "--target", "--program", "--current", "--minutes", "--power", "--coils"].includes(arg)) options[arg.slice(2)] = args.shift();
     else if (arg.startsWith("-")) throw new Error(`unknown option "${arg}"\n${USAGE}`);
     else positionals.push(arg);
   }
@@ -559,6 +654,7 @@ try {
   else if (command === "read" && device === "mendi") await readMendi(options.target);
   else if (command === "read" && device === "thync") await readThync(options.target);
   else if (command === "write" && device === "thync") await writeThync(options);
+  else if (command === "write" && device === "neorhythm") await writeNeoRhythm(options);
   else throw new Error(`${command}: unsupported device "${options.device}"`);
 } catch (error) {
   console.error(error.message);
