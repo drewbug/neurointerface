@@ -132,7 +132,249 @@ function decodeProtobuf(bytes) {
   return fields;
 }
 
-// ---- Node only from here on; index.html carries a verbatim copy of everything above (minus the shebang) ----
+const THYNC_SERVICE = "3789ff10-16ad-11e4-8c21-0800200c9a66";
+const THYNC_DATA = "3789ff11-16ad-11e4-8c21-0800200c9a66";
+const SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb";
+const SOFTWARE_REVISION = "00002a28-0000-1000-8000-00805f9b34fb";
+// Thync frames: [id, (destination << 4) | source, ...payload]
+const PUCK = {
+  Echo: 0, Led: 1, Trigger: 2, Label: 3, NumDisplay: 4, Shutdown: 5, ErrorDebug: 6, ReadBatteryVoltage: 7, BatteryVoltage: 8,
+  ReadButton: 9, Button: 10, HvControl: 11, ReadDeviceName: 12, DeviceName: 13, ReadFirmwareVersion: 14, FirmwareVersion: 15,
+  NewWave: 16, WaveSegment: 17, WaveSwap: 18, WaveControl: 19, WaveSave: 20, WaveReserved: 21, ReadSourceVoltage: 22, SourceVoltage: 23,
+  ReadImpedance: 24, Impedance: 25, Stm32FirmwarePreamble: 26, Stm32FirmwarePayload: 27, Stm32Restart: 28, WriteDeviceName: 29,
+  DownloadStart: 30, DownloadSamples: 31, DownloadFinish: 32, WaveTimerStart: 33, WaveTimerStop: 34, WaveQueueAvailable: 35,
+  ResetFromFault: 36, STFirmwareDownloadStart: 37, STAddress: 38, STData: 39, UpdateDone: 40, STUpdateError: 41, ElectrodeDetect: 42,
+  ElectrodeType: 43, LED_Pattern: 44, STErase: 50, LED_Flash: 56, ReadSerial: 58, SerialResponse: 59, ReadBatteryDetail: 62,
+  BatteryDetailResponse: 63, LEDIntensity: 64, WaveStatus: 76, AMCompact: 78,
+};
+const PUCK_NAME = Object.fromEntries(Object.entries(PUCK).map(([name, id]) => [id, name]));
+const ENDPOINT = { phone: 1, pc: 2, lbm: 4, stm: 8 };
+const STM_ERRORS = {
+  0x1000: "SEGMENT_TOO_SHORT", 0x1001: "SEGMENT_TOO_LONG", 0x1002: "WAVE_SEGMENT_DEF_MISSING", 0x1003: "UNDEFINED",
+  0x1004: "CURRENT_ASKED_OUT_OF_RANGE", 0x1005: "SMARTPHONE_WATCHDOG_TIMEOUT", 0x1006: "DC_LIMITS_FAULT", 0x1007: "NO_WAVE_STRUCT_AVAILABLE",
+  0x1008: "TIME_DELAY_SCAN_ASKED_WITHOUT_WAVE", 0x1009: "NB_SEGMENTS_OUT_OF_RANGE", 0x100a: "IMPEDANCE_OUT_OF_RANGE_SHUTDOWN",
+  0x100b: "ELECTRODE_DETECT_WHILE_PLAYING", 0x100c: "ELECTRODE_DETECT_FAILED", 0x100d: "CHECK_PAD",
+};
+const STM_SHUTDOWN_ERRORS = [0x1004, 0x1006, 0x100a, 0x100d];
+const ELECTRODE_STATES = ["NOT_CONNECTED", "CALM", "ENERGY", "CALM_HEAD", "ENERGY_HEAD", "HEAD"];
+
+neurointerface.Thync = class Thync {
+  constructor(connection) {
+    this.connection = connection;
+    this.listeners = new Set();
+  }
+
+  static matchesName(name) {
+    return /thync/i.test(name);
+  }
+
+  static async request() {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "Thync" }, { services: [THYNC_SERVICE] }],
+      optionalServices: [THYNC_SERVICE, DEVICE_INFORMATION],
+    });
+    return new Thync(neurointerface.webBluetoothConnection(device));
+  }
+
+  static segments(wave) { return thyncSegments(wave); }
+
+  get name() { return this.connection.name; }
+
+  async connect() {
+    await this.connection.connect();
+    this.data = await (await this.connection.getService(THYNC_SERVICE)).getCharacteristic(THYNC_DATA);
+    this.unsubscribe = await this.data.subscribe((bytes) => {
+      const message = decodePuck(bytes);
+      for (const listener of this.listeners) listener(message);
+    });
+  }
+
+  async disconnect() {
+    await this.unsubscribe?.();
+    this.unsubscribe = null;
+    await this.connection.disconnect();
+  }
+
+  onMessage(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  send(id, destination, payload = []) {
+    return this.data.write(encodePuck(id, ENDPOINT.phone, destination, payload));
+  }
+
+  async request(id, destination, payload, matches, timeout = 5000) {
+    let settle;
+    const reply = new Promise((resolve) => { settle = resolve; });
+    const off = this.onMessage((message) => { if (matches(message)) settle(message); });
+    const timer = setTimeout(() => settle(null), timeout);
+    try {
+      await this.send(id, destination, payload);
+      return await reply;
+    } finally {
+      clearTimeout(timer);
+      off();
+    }
+  }
+
+  resetFromFault() { return this.send(PUCK.ResetFromFault, ENDPOINT.stm); }
+  keepAlive() { return this.send(PUCK.ReadBatteryDetail, ENDPOINT.lbm); } // the app's watchdog tick while a wave plays
+
+  async readDeviceInfo() {
+    const text = async (uuid) => {
+      try { return payloadText(await (await (await this.connection.getService(DEVICE_INFORMATION)).getCharacteristic(uuid)).read()); }
+      catch { return undefined; }
+    };
+    const firmware = async (source) =>
+      payloadText((await this.request(PUCK.ReadFirmwareVersion, source, [], (m) => m.id === PUCK.FirmwareVersion && m.source === source))?.payload);
+    return {
+      deviceName: payloadText((await this.request(PUCK.ReadDeviceName, ENDPOINT.lbm, [], (m) => m.id === PUCK.DeviceName))?.payload),
+      serial: await text(SERIAL_NUMBER),
+      hardware: await text(HARDWARE_REVISION),
+      firmware: await text(FIRMWARE_REVISION),
+      software: await text(SOFTWARE_REVISION),
+      firmwareLbm: await firmware(ENDPOINT.lbm),
+      firmwareStm: await firmware(ENDPOINT.stm),
+    };
+  }
+
+  async readBattery() {
+    const message = await this.request(PUCK.ReadBatteryDetail, ENDPOINT.lbm, [], (m) => m.id === PUCK.BatteryDetailResponse);
+    return message && decodeBatteryDetail(message.payload);
+  }
+
+  async readImpedance() {
+    const message = await this.request(PUCK.ReadImpedance, ENDPOINT.stm, [], (m) => m.id === PUCK.Impedance);
+    return message && decodeImpedance(message.payload);
+  }
+
+  async detectElectrode() {
+    const message = await this.request(PUCK.ElectrodeDetect, ENDPOINT.stm, [], (m) => m.id === PUCK.ElectrodeType);
+    return message && decodeElectrode(message.payload);
+  }
+
+  ledPattern(pattern) { return this.send(PUCK.LED_Pattern, ENDPOINT.lbm, [pattern & 0xff]); }
+  ledIntensity(level) { return this.send(PUCK.LEDIntensity, ENDPOINT.lbm, [level & 0xff]); }
+  ledFlash(on) { return this.send(PUCK.LED_Flash, ENDPOINT.lbm, [on ? 0 : 1]); }
+  shutdown() { return this.send(PUCK.Shutdown, ENDPOINT.lbm); }
+
+  // fresh: first wave of a session (NewWave 0); otherwise re-arm at a new current (NewWave 1)
+  async startWave(wave, fresh = true) {
+    const segments = thyncSegments(wave);
+    await this.send(PUCK.NewWave, ENDPOINT.stm, [fresh ? 0 : 1, fresh ? segments.length : 0, 0, 0]);
+    for (const [index, { duration, current, state }] of segments.entries()) {
+      await this.send(PUCK.WaveSegment, ENDPOINT.stm, [index, duration & 0xff, (duration >> 8) & 0xff, (duration >> 16) & 0xff, current & 0xff, (current >> 8) & 0xff, state]);
+    }
+    await this.send(PUCK.WaveControl, ENDPOINT.stm, [2, 0, 0]);
+  }
+
+  stopWave() { return this.send(PUCK.WaveControl, ENDPOINT.stm, [0, 0, 0]); }
+};
+
+function encodePuck(id, source, destination, payload) {
+  return Uint8Array.of(id & 0xff, ((destination << 4) | (source & 0x0f)) & 0xff, ...payload);
+}
+
+function decodePuck(bytes) {
+  const id = bytes[0];
+  if (id === PUCK.ErrorDebug) {
+    const code = bytes.length >= 4 ? (bytes[bytes.length - 1] << 8) | bytes[bytes.length - 2] : undefined;
+    return { id, name: "ErrorDebug", code, error: STM_ERRORS[code] ?? (code === undefined ? "UNKNOWN" : `0x${code.toString(16)}`), fatal: STM_SHUTDOWN_ERRORS.includes(code), payload: bytes.subarray(1) };
+  }
+  const header = bytes[1] ?? 0;
+  return { id, name: PUCK_NAME[id] ?? `0x${id.toString(16)}`, destination: header >> 4, source: header & 0x0f, payload: bytes.subarray(2) };
+}
+
+function payloadText(bytes) {
+  return bytes && String.fromCharCode(...bytes.filter((byte) => byte));
+}
+
+function decodeBatteryDetail(payload) {
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const u16 = (offset) => payload.length >= offset + 2 ? view.getUint16(offset, true) : undefined;
+  return { percent: payload[4], millivolts: u16(2), remainingMah: u16(0), milliamps: payload.length >= 8 ? view.getInt16(6, true) : undefined };
+}
+
+function decodeImpedance(payload) {
+  return payload.length >= 2 ? (payload[0] << 8) | payload[1] : undefined;
+}
+
+function decodeElectrode(payload) {
+  return payload.length ? ELECTRODE_STATES[payload[0]] ?? `0x${payload[0].toString(16)}` : undefined;
+}
+
+// wave: { current (mA), frequency (Hz), duty (%), dc (%), direction ("a" | "b"), shortCircuit, energy }
+const PULSE_A = 3, PULSE_B = 48, OPEN = 0, SHORT = 85, TIMER_HZ = 12000000, DURATION_MASK = 0xffffff;
+const clampDuration = (value) => Math.max(Math.min(Math.trunc(value), DURATION_MASK), 0);
+const waveState = (directionA, shortCircuit, energy, length) => (energy << 4) | (shortCircuit << 5) | (directionA << 6) | length;
+const WAVE_STATES = {
+  [waveState(1, 0, 0, 4)]: [PULSE_A, OPEN, PULSE_B, OPEN], [waveState(1, 1, 0, 4)]: [PULSE_A, SHORT, PULSE_B, SHORT],
+  [waveState(0, 0, 0, 4)]: [PULSE_B, OPEN, PULSE_A, OPEN], [waveState(0, 1, 0, 4)]: [PULSE_B, SHORT, PULSE_A, SHORT],
+  [waveState(1, 0, 0, 2)]: [PULSE_A, OPEN], [waveState(1, 1, 0, 2)]: [PULSE_A, SHORT],
+  [waveState(0, 0, 0, 2)]: [PULSE_B, OPEN], [waveState(0, 1, 0, 2)]: [PULSE_B, SHORT],
+  [waveState(1, 0, 1, 3)]: [PULSE_A, SHORT, OPEN], [waveState(1, 1, 1, 3)]: [PULSE_A, SHORT, SHORT],
+  [waveState(0, 0, 1, 3)]: [PULSE_B, SHORT, OPEN], [waveState(0, 1, 1, 3)]: [PULSE_B, SHORT, SHORT],
+  [waveState(1, 0, 1, 5)]: [PULSE_A, OPEN, SHORT, PULSE_B, OPEN], [waveState(1, 1, 1, 5)]: [PULSE_A, SHORT, SHORT, PULSE_B, SHORT],
+  [waveState(0, 0, 1, 5)]: [PULSE_B, OPEN, SHORT, PULSE_A, OPEN], [waveState(0, 1, 1, 5)]: [PULSE_B, SHORT, SHORT, PULSE_A, SHORT],
+};
+
+function thyncSegments({ current, frequency = 9699, duty = 50, dc = 0, direction = "a", shortCircuit = false, energy = false }) {
+  const dutyFraction = 0.01 * duty, dcFraction = 0.01 * dc;
+  const duration1 = clampDuration((1 - dutyFraction) * TIMER_HZ / (2 * frequency));
+  const half = (1 - dcFraction) * dutyFraction * TIMER_HZ / (2 * frequency);
+  const full = Math.trunc(dutyFraction * TIMER_HZ / frequency);
+  const current0 = Math.trunc(current * 256) & 0xffff;
+  let durations, currents;
+  if (!energy) {
+    const duration2 = clampDuration(half);
+    durations = [full - duration2, duration1, duration2, clampDuration(duration1)];
+    currents = [current0, 0, current0, 0];
+  } else {
+    const duration3 = clampDuration(half);
+    durations = [clampDuration(full - duration3), duration1, 60, clampDuration(duration3 - 60), clampDuration(duration1)];
+    currents = [current0, 0, 0, current0, 0];
+  }
+  const states = WAVE_STATES[waveState(direction === "a" ? 1 : 0, shortCircuit ? 1 : 0, energy ? 1 : 0, durations.length)];
+  if (!states) throw new Error("no wave state table for these parameters");
+  const segments = durations.map((duration, i) => ({ duration, state: states[i], current: currents[i], tooShort: 0 }));
+  return energy && !(frequency > 2000) ? correctEnergySegments(segments) : correctShortSegments(segments);
+}
+
+function classifySegments(segments) {
+  const pulse = [], idle = [];
+  for (const segment of segments) {
+    if (segment.duration < 36) segment.tooShort = 36 - segment.duration;
+    (segment.state === PULSE_A || segment.state === PULSE_B ? pulse : idle).push(segment);
+  }
+  return { pulse, idle };
+}
+
+function correctShortSegments(segments) {
+  const { pulse: [p1, p2], idle: [v1, v2, v3] } = classifySegments(segments);
+  if (p1 && Math.max(p2?.duration ?? 0, p1.duration) === p1.duration) {
+    if (p1.duration < 84) p1.duration = 84;
+    if (p2 && p2.duration < 36) p2.duration = 36;
+  } else {
+    if (p2 && p2.duration < 84) p2.duration = 84;
+    if (p1 && p1.duration < 36) p1.duration = 36;
+  }
+  if (v1 && v1.tooShort > 0) v1.duration = 36;
+  if (v2 && v2.tooShort > 0) { v1.duration = 36; v2.duration = v1.duration; }
+  if (v3 && v3.tooShort > 0) { v1.duration = 36; v3.duration = v1.duration; }
+  return segments;
+}
+
+function correctEnergySegments(segments) {
+  const { pulse: [, p2] } = classifySegments(segments);
+  if (segments.length === 5 && p2) {
+    const index = segments.indexOf(p2);
+    segments[index - 1] = { duration: 132, state: PULSE_B, current: roundHalfEven(p2.current * 1.9) & 0xffff, tooShort: 0 };
+  }
+  return segments;
+}
+
+const roundHalfEven = (value) => { const rounded = Math.round(value); return Math.abs(value % 1) === 0.5 && rounded % 2 ? rounded - 1 : rounded; };
 
 const bareUuid = (uuid) => uuid.toLowerCase().replace(/-/g, "").replace(/^0000(.{4})00001000800000805f9b34fb$/, "$1");
 
@@ -180,7 +422,9 @@ const USAGE = [
   "Usage:",
   "  neurointerface scan",
   "  neurointerface read --device mendi [--target <id|address|name>]",
+  "  neurointerface write --device thync --program calm|energy [--current <mA>] [--minutes <n>] [--target <id|address|name>]",
 ].join("\n");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function startNoble() {
   const noble = (await import("@stoprocent/noble")).default;
@@ -192,25 +436,90 @@ async function scan() {
   const noble = await startNoble();
   noble.on("discover", (peripheral) => console.log(describe(peripheral)));
   await noble.startScanningAsync([], false);
-  await new Promise((resolve) => setTimeout(resolve, SCAN_MS));
+  await sleep(SCAN_MS);
   await noble.stopScanningAsync();
   noble.stop();
 }
 
-async function readMendi(target) {
+async function connectTo(Device, target) {
   const noble = await startNoble();
   const peripheral = await findPeripheral(noble, (candidate) => target
     ? [candidate.id, candidate.address, candidate.advertisement.localName].includes(target)
-    : neurointerface.Mendi.matchesName(candidate.advertisement.localName));
-  const mendi = new neurointerface.Mendi(neurointerface.nobleConnection(peripheral));
-  await mendi.connect();
+    : Device.matchesName(candidate.advertisement.localName));
+  const device = new Device(neurointerface.nobleConnection(peripheral));
+  await device.connect();
   console.error(describe(peripheral));
+  return { noble, device };
+}
+
+async function readMendi(target) {
+  const { noble, device: mendi } = await connectTo(neurointerface.Mendi, target);
   console.error(JSON.stringify(await mendi.readDeviceInfo()));
   console.error(JSON.stringify(await mendi.readBattery()));
   const unsubscribe = await mendi.subscribeFrames((frame) => console.log(JSON.stringify(frame)));
   await new Promise((resolve) => process.once("SIGINT", resolve));
   await unsubscribe();
   await mendi.disconnect();
+  noble.stop();
+}
+
+async function readThync(target) {
+  const { noble, device: thync } = await connectTo(neurointerface.Thync, target);
+  await thync.resetFromFault();
+  console.error(JSON.stringify(await thync.readDeviceInfo()));
+  thync.onMessage((message) => { if (message.error) console.log(JSON.stringify({ error: message.error })); });
+  let stop = false;
+  process.once("SIGINT", () => { stop = true; });
+  for (let tick = 0; !stop; tick++) {
+    const electrode = await thync.detectElectrode();
+    console.log(JSON.stringify(tick % 2 ? { electrode, impedance: await thync.readImpedance() } : { electrode, battery: await thync.readBattery() }));
+    await sleep(1250);
+  }
+  await thync.disconnect();
+  noble.stop();
+}
+
+async function writeThync({ program, current = "1", minutes = "1", target }) {
+  if (program !== "calm" && program !== "energy") throw new Error(`write: --program must be calm or energy\n${USAGE}`);
+  current = Number(current); minutes = Number(minutes);
+  if (!(current > 0 && current <= 3)) throw new Error("write: --current must be between 0 and 3 mA");
+  if (!(minutes > 0)) throw new Error("write: --minutes must be positive");
+  const { noble, device: thync } = await connectTo(neurointerface.Thync, target);
+  await thync.resetFromFault();
+  console.error(JSON.stringify(await thync.readDeviceInfo()));
+  let stop = false, fault = false;
+  thync.onMessage((message) => {
+    if (!message.error) return;
+    console.error(`device error: ${message.error}`);
+    if (message.fatal) stop = fault = true;
+  });
+  process.once("SIGINT", () => { stop = true; });
+  const steps = 5, ramp = 2000, wave = { energy: program === "energy" };
+  console.error(`${program}: ramping up to ${current} mA`);
+  for (let step = 1; step <= steps && !stop; step++) {
+    await thync.startWave({ ...wave, current: current * step / steps }, step === 1);
+    await thync.keepAlive();
+    await sleep(ramp / steps);
+  }
+  console.error(`holding ${current} mA for ${minutes} min (Ctrl-C to stop early)`);
+  const end = Date.now() + minutes * 60000;
+  let refreshed = Date.now();
+  while (Date.now() < end && !stop) {
+    const battery = await thync.readBattery();
+    if (battery) console.log(JSON.stringify({ battery }));
+    if (Date.now() - refreshed >= 5000 && !stop) { await thync.startWave({ ...wave, current }, false); refreshed = Date.now(); }
+    await sleep(1250);
+  }
+  if (!fault) {
+    console.error("ramping down");
+    for (let step = steps - 1; step > 0; step--) {
+      await thync.startWave({ ...wave, current: current * step / steps }, false);
+      await sleep(ramp / steps);
+    }
+  }
+  await thync.stopWave();
+  console.error(fault ? "stopped after a device fault" : "stopped");
+  await thync.disconnect();
   noble.stop();
 }
 
@@ -238,17 +547,19 @@ try {
   while (args.length) {
     const arg = args.shift();
     if (arg === "-h" || arg === "--help") options.help = true;
-    else if (arg === "--device" || arg === "--target") options[arg.slice(2)] = args.shift();
+    else if (["--device", "--target", "--program", "--current", "--minutes"].includes(arg)) options[arg.slice(2)] = args.shift();
     else if (arg.startsWith("-")) throw new Error(`unknown option "${arg}"\n${USAGE}`);
     else positionals.push(arg);
   }
-  const [command] = positionals;
+  const [command] = positionals, device = options.device?.toLowerCase();
   if (options.help || !command) console.log(USAGE);
   else if (command === "scan") await scan();
-  else if (command !== "read") throw new Error(`unknown command "${command}"\n${USAGE}`);
-  else if (!options.device) throw new Error(`read: --device is required\n${USAGE}`);
-  else if (options.device.toLowerCase() !== "mendi") throw new Error(`read: unsupported device "${options.device}" (only mendi is implemented)`);
-  else await readMendi(options.target);
+  else if (command !== "read" && command !== "write") throw new Error(`unknown command "${command}"\n${USAGE}`);
+  else if (!device) throw new Error(`${command}: --device is required\n${USAGE}`);
+  else if (command === "read" && device === "mendi") await readMendi(options.target);
+  else if (command === "read" && device === "thync") await readThync(options.target);
+  else if (command === "write" && device === "thync") await writeThync(options);
+  else throw new Error(`${command}: unsupported device "${options.device}"`);
 } catch (error) {
   console.error(error.message);
   process.exit(1);
